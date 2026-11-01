@@ -1,0 +1,241 @@
+#!/bin/bash
+# provenance-post-receive — sporeGate publish hook
+#
+# Three-body flow aligned to the neutron:
+#   eastgate (inside) → push → Forgejo → this hook → golgi publishes
+#   northgate (outside) → push → Forgejo → this hook → golgi publishes
+#   Single source of truth: Forgejo on eastgate
+#
+# ═══ OSMOTIC MEMBRANE MODEL ═══
+#
+# The diff between committed and published IS the osmotic pressure.
+# Rate limiting IS a sync lock — one publish at a time through the gate.
+# Backpressure slows via friction (lock held = pressure accumulates).
+# On release, the burst makes up the difference (ff-only catches all commits).
+# Implosion (inbound push) and explosion (outbound publish) resolve to null.
+# Directionality: which gate pushed determines pressure gradient direction.
+#
+# Null shift cycle:
+#   null  → implosion  (receiving push, pressure rises)
+#   black → friction   (lock check, rate limit, diff = osmotic pressure)
+#   white → explosion  (publishing to golgi, pressure releasing)
+#   null  → equilibrium (published = committed, pressure zero)
+
+set -euo pipefail
+
+LOG="/var/log/forgejo/sporegate-publish.log"
+LOCK="/var/lock/sporegate"
+# Braid API — through the membrane surface (Caddy → opsonize on golgi)
+BRAID_API="https://neutron.primals.eco/api/discuss"
+# Pi-bus on golgi (signaled via SSH)
+PIBUS="/run/membrane"
+
+mkdir -p "$(dirname "$LOG")" "$LOCK"
+
+# ═══ OSMOTIC PRESSURE — measure diff as concentration gradient ═══
+measure_pressure() {
+    local oldrev="$1"
+    local newrev="$2"
+    local file_count=0
+    local insertions=0
+    local deletions=0
+
+    if [ "$oldrev" = "0000000000000000000000000000000000000000" ]; then
+        echo "initial|0|0|0"
+        return
+    fi
+
+    file_count=$(git diff --name-only "$oldrev" "$newrev" 2>/dev/null | wc -l || echo 0)
+    local stat_line=$(git diff --shortstat "$oldrev" "$newrev" 2>/dev/null || echo "")
+    insertions=$(echo "$stat_line" | grep -oP '\d+(?= insertion)' || echo 0)
+    deletions=$(echo "$stat_line" | grep -oP '\d+(?= deletion)' || echo 0)
+
+    # Osmotic pressure = net change magnitude
+    echo "${file_count}|${insertions}|${deletions}|$(( insertions + deletions ))"
+}
+
+# ═══ RATE LIMIT — sync lock (friction) ═══
+# Only one publish per repo at a time. Backpressure accumulates.
+acquire_lock() {
+    local repo="$1"
+    local lockfile="$LOCK/${repo}.lock"
+
+    if [ -f "$lockfile" ]; then
+        local lock_age=$(( $(date +%s) - $(stat -c %Y "$lockfile" 2>/dev/null || echo 0) ))
+        if [ "$lock_age" -lt 30 ]; then
+            # Friction — backpressure active
+            echo "  ⊘ friction: $repo locked (${lock_age}s), pressure accumulating" >> "$LOG"
+            return 1
+        fi
+        # Stale lock — release makes up the difference
+        echo "  ⊕ stale lock released after ${lock_age}s — burst catchup" >> "$LOG"
+        rm -f "$lockfile"
+    fi
+
+    echo "$$" > "$lockfile"
+    return 0
+}
+
+release_lock() {
+    local repo="$1"
+    rm -f "$LOCK/${repo}.lock"
+}
+
+# ═══ BRAID POST — write to opsonize neutron bus ═══
+post_to_braid() {
+    local repo="$1"
+    local rev="$2"
+    local author="$3"
+    local msg="$4"
+    local pressure="$5"
+    local direction="$6"
+    local result="$7"
+
+    IFS='|' read -r files ins del magnitude <<< "$pressure"
+    local body="SPOREGATE PUBLISH | $(date -u +%Y-%m-%dT%H:%M:%SZ) | ${direction} | ${repo} ${rev} | ${result} | Δ${files}f +${ins}/-${del} (pressure: ${magnitude}) | ${author}: ${msg}"
+
+    # Post to braid — fire and forget, never block the push
+    curl -s --max-time 3 -X POST "$BRAID_API" \
+        -d "{\"page\": \"vcs-membrane\", \"author\": \"sporeGate\", \"body\": $(echo "$body" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo "\"$body\"")}" \
+        >/dev/null 2>&1 || true
+}
+
+# ═══ PI-BUS NOTIFY — signal downstream listeners ═══
+notify_pibus() {
+    local repo="$1"
+    local ts=$(date +%s)
+
+    # Touch pi-bus file on golgi — inotifywait listeners wake up
+    ssh -o ConnectTimeout=3 golgi \
+        "echo '$ts' > $PIBUS/pibus-sporegate-${repo}; touch $PIBUS/ready-sporegate-${repo}" \
+        2>/dev/null || true
+}
+
+# ═══ PUBLISH — pull to golgi, rsync if needed ═══
+publish_to_golgi() {
+    local repo="$1"
+    local rev="$2"
+    local repo_dir=""
+    local site_dir=""
+    local subpath=""
+
+    case "$repo" in
+        wateringhole)
+            repo_dir="/opt/ecoPrimals/sporePrint"
+            ;;
+        hud)
+            repo_dir="/opt/ecoPrimals/hud-repo"
+            site_dir="/opt/ecoPrimals/hud"
+            subpath="site"
+            ;;
+        hypothesis)
+            repo_dir="/opt/ecoPrimals/hypothesis-repo"
+            site_dir="/opt/ecoPrimals/hypothesis"
+            subpath="site"
+            ;;
+        signal)
+            repo_dir="/opt/ecoPrimals/signal-repo"
+            site_dir="/opt/ecoPrimals/signal"
+            subpath="site"
+            ;;
+        tuebor)
+            repo_dir="/opt/ecoPrimals/tuebor-repo"
+            ;;
+        sporeprint)
+            repo_dir="/opt/ecoPrimals/sporePrint"
+            ;;
+        detroit)
+            repo_dir="/opt/ecoPrimals/detroit"
+            ;;
+        thesis)
+            repo_dir="/opt/ecoPrimals/thesis"
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+
+    # Explosion — publish (pull + rsync)
+    local pull_result
+    pull_result=$(ssh -o ConnectTimeout=5 golgi "cd $repo_dir && git pull origin main --ff-only 2>&1" 2>&1) || {
+        echo "  ✗ pull failed: $pull_result" >> "$LOG"
+        return 1
+    }
+    echo "  pull: $(echo "$pull_result" | tail -1)" >> "$LOG"
+
+    # Rsync if site_dir differs (near-atomic with --delay-updates)
+    if [ -n "$site_dir" ] && [ -n "$subpath" ]; then
+        ssh -o ConnectTimeout=5 golgi \
+            "rsync -a --delete --delay-updates $repo_dir/$subpath/ $site_dir/$subpath/ 2>&1" \
+            >> "$LOG" 2>&1 || {
+            echo "  ✗ rsync failed" >> "$LOG"
+            return 1
+        }
+        echo "  sync: $repo_dir/$subpath → $site_dir/$subpath" >> "$LOG"
+    fi
+
+    return 0
+}
+
+# ═══ MAIN — the null shift cycle ═══
+while read -r oldrev newrev refname; do
+    # Resolve repo name (Forgejo sets GIT_DIR=.)
+    REPO_NAME=$(basename "$(cd "${GIT_DIR:-.}" && pwd)" .git)
+    BRANCH=$(basename "$refname")
+
+    # Only publish main branch
+    [ "$BRANCH" = "main" ] || continue
+
+    TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    COMMIT_MSG=$(git log -1 --format="%s" "$newrev" 2>/dev/null || echo "unknown")
+    COMMIT_AUTHOR=$(git log -1 --format="%an" "$newrev" 2>/dev/null || echo "unknown")
+    SHORT_REV=$(echo "$newrev" | cut -c1-7)
+
+    # ═══ DIRECTIONALITY — where does the pressure point? ═══
+    # The author tells us which gate pushed.
+    # The branch tells us which direction.
+    # inside→outside = eastgate author, main branch = explosion
+    # outside→inside = northgate/GitHub author = implosion then explosion
+    DIRECTION="inside→outside"
+    case "$COMMIT_AUTHOR" in
+        *northgate*|*github*|*bot*) DIRECTION="outside→inside" ;;
+    esac
+
+    echo "" >> "$LOG"
+    echo "$TS [$REPO_NAME] $SHORT_REV $DIRECTION" >> "$LOG"
+    echo "  by: $COMMIT_AUTHOR" >> "$LOG"
+    echo "  msg: $COMMIT_MSG" >> "$LOG"
+
+    # ═══ NULL → IMPLOSION — pressure measurement ═══
+    PRESSURE=$(measure_pressure "$oldrev" "$newrev")
+    IFS='|' read -r P_FILES P_INS P_DEL P_MAG <<< "$PRESSURE"
+    echo "  pressure: Δ${P_FILES}f +${P_INS}/-${P_DEL} (magnitude: ${P_MAG})" >> "$LOG"
+
+    # ═══ IMPLOSION → FRICTION — rate limit check ═══
+    (
+        if ! acquire_lock "$REPO_NAME"; then
+            # Backpressure — log it, let the next push catch up
+            post_to_braid "$REPO_NAME" "$SHORT_REV" "$COMMIT_AUTHOR" "$COMMIT_MSG" "$PRESSURE" "$DIRECTION" "FRICTION"
+            exit 0
+        fi
+
+        # ═══ FRICTION → EXPLOSION — publish ═══
+        RESULT="FAIL"
+        if publish_to_golgi "$REPO_NAME" "$SHORT_REV"; then
+            RESULT="OK"
+            echo "  ✓ $REPO_NAME $SHORT_REV → golgi $(date -u +%H:%M:%SZ)" >> "$LOG"
+
+            # ═══ EXPLOSION → NULL — equilibrium ═══
+            notify_pibus "$REPO_NAME"
+        else
+            echo "  ✗ $REPO_NAME $SHORT_REV failed $(date -u +%H:%M:%SZ)" >> "$LOG"
+        fi
+
+        # Post to braid (the neutron bus)
+        post_to_braid "$REPO_NAME" "$SHORT_REV" "$COMMIT_AUTHOR" "$COMMIT_MSG" "$PRESSURE" "$DIRECTION" "$RESULT"
+
+        # Release lock — if pressure accumulated during friction, next push bursts through
+        release_lock "$REPO_NAME"
+    ) &
+
+done
